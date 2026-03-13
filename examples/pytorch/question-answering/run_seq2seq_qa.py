@@ -21,12 +21,14 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+import datetime
 
 import datasets
 import evaluate
 import numpy as np
 from datasets import load_dataset
 from trainer_seq2seq_qa import QuestionAnsweringSeq2SeqTrainer
+from stitch_for_qa import StitchArguments, maybe_run_stitching
 
 import transformers
 from transformers import (
@@ -49,7 +51,7 @@ check_min_version("4.57.0.dev0")
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/question-answering/requirements.txt")
 
 logger = logging.getLogger(__name__)
-
+logger.setLevel(logging.INFO)
 
 @dataclass
 class ModelArguments:
@@ -273,13 +275,13 @@ def main():
     # or by passing the --help flag to this script.
     # We now keep distinct sets of args, for a cleaner separation of concerns.
 
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, Seq2SeqTrainingArguments, StitchArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
         # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
+        model_args, data_args, training_args, stitch_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+        model_args, data_args, training_args, stitch_args = parser.parse_args_into_dataclasses()
 
     # Setup logging
     logging.basicConfig(
@@ -294,6 +296,32 @@ def main():
 
     log_level = training_args.get_process_log_level()
     logger.setLevel(log_level)
+
+
+    from datetime import datetime
+    import os
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    training_args.output_dir = os.path.join(
+        training_args.output_dir,
+        f"run_{timestamp}"
+    )
+
+    os.makedirs(training_args.output_dir, exist_ok=True)
+
+    log_file = os.path.join(training_args.output_dir, "train.log")
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(log_level)
+
+    file_handler.setFormatter(
+        logging.Formatter("[%(levelname)s|%(filename)s:%(lineno)s] %(asctime)s >> %(message)s")
+    )
+
+    logger.addHandler(file_handler)
+
+    logger.info(f"Logging to: {log_file}")
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
@@ -345,6 +373,15 @@ def main():
             cache_dir=model_args.cache_dir,
             token=model_args.token,
         )
+
+    # ---- FILTER SQUAD V2 NO-ANSWER EXAMPLES ----
+    def has_answer(example):
+        return len(example["answers"]["text"]) > 0
+
+    for split in raw_datasets.keys():
+        raw_datasets[split] = raw_datasets[split].filter(has_answer)
+    # --------------------------------------------
+    
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.
 
@@ -559,10 +596,10 @@ def main():
                 load_from_cache_file=not data_args.overwrite_cache,
                 desc="Running tokenizer on validation dataset",
             )
-        if data_args.max_eval_samples is not None:
-            # During Feature creation dataset samples might increase, we will select required samples again
-            max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
-            eval_dataset = eval_dataset.select(range(max_eval_samples))
+        # if data_args.max_eval_samples is not None:
+        #     # During Feature creation dataset samples might increase, we will select required samples again
+        #     max_eval_samples = min(len(eval_dataset), data_args.max_eval_samples)
+        #     eval_dataset = eval_dataset.select(range(max_eval_samples))
 
     if training_args.do_predict:
         if "test" not in raw_datasets:
@@ -599,8 +636,75 @@ def main():
         "squad_v2" if data_args.version_2_with_negative else "squad", cache_dir=model_args.cache_dir
     )
 
+    rouge_metric = evaluate.load("rouge", cache_dir=model_args.cache_dir)
+    bertscore_metric = evaluate.load("bertscore", cache_dir=model_args.cache_dir)
+
+    # def compute_metrics(p: EvalPrediction):
+    #     return metric.compute(predictions=p.predictions, references=p.label_ids)
+
     def compute_metrics(p: EvalPrediction):
-        return metric.compute(predictions=p.predictions, references=p.label_ids)
+        # Existing SQuAD-style metrics (exact_match, f1, etc.)
+        squad_metrics = metric.compute(predictions=p.predictions, references=p.label_ids)
+
+        # Convert QA-format predictions/references into plain text
+        pred_texts = [pred["prediction_text"] for pred in p.predictions]
+
+        ref_texts = []
+        for ref in p.label_ids:
+            answers = ref["answers"]["text"]
+            ref_texts.append(answers[0] if len(answers) > 0 else "")
+
+        # ROUGE
+        rouge_results = rouge_metric.compute(
+            predictions=pred_texts,
+            references=ref_texts,
+            use_stemmer=True,
+        )
+
+        # BERTScore
+        def _safe_for_bertscore(texts):
+            safe = []
+            for x in texts:
+                if x is None:
+                    x = ""
+                elif not isinstance(x, str):
+                    x = str(x)
+                x = x.strip()
+                if not x:
+                    x = "[EMPTY]"
+                safe.append(x)
+            return safe
+        
+        for i, (p, r) in enumerate(zip(pred_texts, ref_texts)):
+            if not isinstance(p, str) or not isinstance(r, str) or not p.strip() or not r.strip():
+                print(f"[DEBUG] bad bertscore pair at idx={i}: pred={repr(p)} ref={repr(r)}")
+                break
+
+        safe_pred_texts = _safe_for_bertscore(pred_texts)
+        safe_ref_texts = _safe_for_bertscore(ref_texts)
+
+        bertscore_results = bertscore_metric.compute(
+            predictions=safe_pred_texts,
+            references=safe_ref_texts,
+            lang="en",
+        )
+
+        # Average BERTScore across examples
+        bertscore_f1 = float(np.mean(bertscore_results["f1"]))
+        bertscore_precision = float(np.mean(bertscore_results["precision"]))
+        bertscore_recall = float(np.mean(bertscore_results["recall"]))
+
+        # Merge everything into one metrics dict
+        return {
+            **squad_metrics,
+            "rouge1": rouge_results["rouge1"],
+            "rouge2": rouge_results["rouge2"],
+            "rougeL": rouge_results["rougeL"],
+            "rougeLsum": rouge_results["rougeLsum"],
+            "bertscore_precision": bertscore_precision,
+            "bertscore_recall": bertscore_recall,
+            "bertscore_f1": bertscore_f1,
+        }
 
     # Post-processing:
     def post_processing_function(
@@ -635,6 +739,48 @@ def main():
         references = [{"id": ex["id"], "answers": ex[answer_column]} for ex in examples]
         return EvalPrediction(predictions=formatted_predictions, label_ids=references)
 
+    # initializing stitching 
+    def build_qa_trainer(
+        *,
+        model,
+        training_args,
+        train_dataset,
+        eval_dataset,
+        eval_examples,
+        tokenizer,
+        data_collator,
+        compute_metrics,
+        post_process_function,
+    ):
+        return QuestionAnsweringSeq2SeqTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            eval_examples=eval_examples,
+            processing_class=tokenizer,
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+            post_process_function=post_process_function,
+        )
+
+    if stitch_args.do_stitching:
+        results = maybe_run_stitching(
+            stitch_args=stitch_args,
+            model_name_or_path=model_args.model_name_or_path,
+            training_args=training_args,
+            tokenizer=tokenizer,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            eval_examples=eval_examples,
+            compute_metrics=compute_metrics if training_args.predict_with_generate else None,
+            post_process_function=post_processing_function,
+            trainer_builder=build_qa_trainer,
+            data_collator=data_collator,
+        )
+        logger.info("Stitching results: %s", results)
+        return
+
     # Initialize our Trainer
     trainer = QuestionAnsweringSeq2SeqTrainer(
         model=model,
@@ -650,6 +796,24 @@ def main():
 
     # Training
     if training_args.do_train:
+        
+        # Pre-training evaluation 
+        if training_args.do_eval: 
+            logger.info("*** Evaluate before fine-tuning ***")
+            max_length = (
+                training_args.generation_max_length
+                if training_args.generation_max_length is not None
+                else data_args.val_max_answer_length
+            )
+            num_beams = data_args.num_beams if data_args.num_beams is not None else training_args.generation_num_beams
+
+            pretrain_metrics = trainer.evaluate(
+                max_length=data_args.val_max_answer_length,
+                num_beams=data_args.num_beams,
+                metric_key_prefix="eval_before_ft",
+            )
+            trainer.log_metrics("eval_before_ft", pretrain_metrics)
+            trainer.save_metrics("eval_before_ft", pretrain_metrics)
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
             checkpoint = training_args.resume_from_checkpoint
@@ -680,6 +844,12 @@ def main():
 
         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+        logger.info(f"Number of raw evaluation examples: {len(eval_examples)}")
+        logger.info(f"Number of processed evaluation features: {len(eval_dataset)}")
+
+        print(f"Number of raw evaluation examples: {len(eval_examples)}")
+        print(f"Number of processed evaluation features: {len(eval_dataset)}")
 
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
