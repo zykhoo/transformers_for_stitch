@@ -28,7 +28,8 @@ import evaluate
 import numpy as np
 from datasets import load_dataset
 from trainer_seq2seq_qa import QuestionAnsweringSeq2SeqTrainer
-from stitch_for_qa import StitchArguments, maybe_run_stitching
+from stitch_for_qa.cli import StitchArguments
+from stitch_for_qa.cli_identity import maybe_run_identity_stitching
 import re
 from typing import Iterable
 
@@ -55,14 +56,23 @@ require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/ques
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+def infer_data_format(path: str) -> str:
+    p = path.lower()
+    if p.endswith(".json") or p.endswith(".json.zst") or p.endswith(".jsonl") or p.endswith(".jsonl.zst"):
+        return "json"
+    if p.endswith(".csv") or p.endswith(".csv.zst"):
+        return "csv"
+    raise ValueError(f"Unsupported file type: {path}")
+
 @dataclass
 class ModelArguments:
     """
     Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
     """
 
-    model_name_or_path: str = field(
-        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    model_name_or_path: str | None = field(
+        default=None,
+        metadata={"help": "Optional top-level model path. Not needed for stitch-only runs."}
     )
     config_name: str | None = field(
         default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
@@ -258,14 +268,11 @@ class DataTrainingArguments:
                 raise ValueError("Need either a dataset name or a training/validation file/test_file.")
 
         if self.train_file is not None:
-            extension = self.train_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+            infer_data_format(self.train_file)
         if self.validation_file is not None:
-            extension = self.validation_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+            infer_data_format(self.validation_file)
         if self.test_file is not None:
-            extension = self.test_file.split(".")[-1]
-            assert extension in ["csv", "json"], "`test_file` should be a csv or a json file."
+            infer_data_format(self.test_file)
 
         if self.val_max_answer_length is None:
             self.val_max_answer_length = self.max_answer_length
@@ -383,48 +390,75 @@ def main():
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
-    config = AutoConfig.from_pretrained(
-        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
-        cache_dir=model_args.cache_dir,
-        use_fast=model_args.use_fast_tokenizer,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
-    model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=model_args.token,
-        trust_remote_code=model_args.trust_remote_code,
-    )
 
-    # We resize the embeddings only when necessary to avoid index errors. If creating a model from scratch
-    # on a small vocab and want a smaller embedding size, remove this test.
-    embedding_size = model.get_input_embeddings().weight.shape[0]
-    if len(tokenizer) > embedding_size:
-        model.resize_token_embeddings(len(tokenizer))
+    # # ---------------------------------
+    # # Stitch-only branch
+    # # ---------------------------------
+    # if stitch_args.do_stitching:
+    #     logger.info("Running stitch-only branch.")
 
-    if model.config.decoder_start_token_id is None:
-        raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+    #     bootstrap_tokenizer_name = (
+    #         stitch_args.target_tokenizer_name_or_path
+    #         or stitch_args.target_base_model_name_or_path
+    #         or stitch_args.source_tokenizer_name_or_path
+    #         or stitch_args.source_base_model_name_or_path
+    #     )
 
-    # Shared data collator for both normal QA and stitching mode
-    label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
-    data_collator = DataCollatorForSeq2Seq(
-        tokenizer,
-        model=model,
-        label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if training_args.fp16 else None,
-    )
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #         bootstrap_tokenizer_name,
+    #         cache_dir=model_args.cache_dir,
+    #         use_fast=model_args.use_fast_tokenizer,
+    #         revision=model_args.model_revision,
+    #         token=model_args.token,
+    #         trust_remote_code=model_args.trust_remote_code,
+    #     )
+    
+    if not stitch_args.do_stitching and model_args.model_name_or_path is None:
+        raise ValueError("--model_name_or_path is required for the non-stitch path.")
+
+        model = None
+    data_collator = None
+
+    if not stitch_args.do_stitching:
+        config = AutoConfig.from_pretrained(
+            model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        model = AutoModelForSeq2SeqLM.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+
+        embedding_size = model.get_input_embeddings().weight.shape[0]
+        if len(tokenizer) > embedding_size:
+            model.resize_token_embeddings(len(tokenizer))
+
+        if model.config.decoder_start_token_id is None:
+            raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
+
+        label_pad_token_id = -100 if data_args.ignore_pad_token_for_loss else tokenizer.pad_token_id
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer,
+            model=model,
+            label_pad_token_id=label_pad_token_id,
+            pad_to_multiple_of=8 if training_args.fp16 else None,
+        )
 
     metric = evaluate.load(
         "squad_v2" if data_args.version_2_with_negative else "squad",
@@ -607,8 +641,8 @@ def main():
             lang="en",
         )
 
-        # pred_readability = _aggregate_readability(pred_texts, prefix="pred")
-        # ref_readability = _aggregate_readability(ref_texts, prefix="ref")
+        pred_readability = _aggregate_readability(pred_texts, prefix="pred")
+        ref_readability = _aggregate_readability(ref_texts, prefix="ref")
 
         return {
             **squad_metrics,
@@ -619,44 +653,34 @@ def main():
             "bertscore_precision": float(np.mean(bertscore_results["precision"])),
             "bertscore_recall": float(np.mean(bertscore_results["recall"])),
             "bertscore_f1": float(np.mean(bertscore_results["f1"])),
-            # **pred_readability,
-            # **ref_readability,
+            **pred_readability,
+            **ref_readability,
         }
 
-
-    def infer_answer_column(examples):
-        # Prefer the standard QA key used by all your stitch datasets.
-        if "answers" in examples.column_names:
-            return "answers"
-        # Fallback if the caller uses a different schema.
-        for candidate in ["answer", "labels", "label"]:
-            if candidate in examples.column_names:
-                return candidate
-        raise ValueError(
-            f"Could not infer answer column from examples. Available columns: {examples.column_names}"
-        )
-
-
-    def make_post_processing_function(tokenizer_for_decode):
+    def make_post_processing_function(tokenizer_for_decode, answer_column_name):
         def post_processing_function(
             examples: datasets.Dataset,
             features: datasets.Dataset,
             outputs: EvalLoopOutput,
             stage="eval",
         ):
-            logger.info(f"POSTPROCESS column names: {examples.column_names}")
-            logger.info(f"POSTPROCESS num examples: {len(examples)}")
+            logger.info("POSTPROCESS column names: %s", examples.column_names)
+            logger.info("POSTPROCESS num examples: %d", len(examples))
             if len(examples) > 0:
-                logger.info("POSTPROCESS first example keys:", examples[0].keys())
+                logger.info("POSTPROCESS first example keys: %s", examples[0].keys())
 
-            answer_column_local = infer_answer_column(examples)
+            answer_column_local = answer_column_name
 
             preds = outputs.predictions
             if isinstance(preds, tuple):
                 preds = preds[0]
 
+            preds = np.array(preds)
+            if preds.ndim == 3:
+                preds = np.argmax(preds, axis=-1)
+
             preds = np.where(preds != -100, preds, tokenizer_for_decode.pad_token_id)
-            decoded_preds = tokenizer_for_decode.batch_decode(preds, skip_special_tokens=True)
+            decoded_preds = tokenizer_for_decode.batch_decode(preds.tolist(), skip_special_tokens=True)
 
             if "id" in examples.column_names:
                 example_ids = [str(x) for x in examples["id"]]
@@ -671,18 +695,39 @@ def main():
                 for i, feature in enumerate(features)
             }
 
+            def to_squad_answers(value):
+                if isinstance(value, dict) and "text" in value:
+                    texts = value.get("text", [])
+                    starts = value.get("answer_start", [0] * len(texts))
+                    return {
+                        "text": [str(x) for x in texts if str(x).strip()],
+                        "answer_start": starts if len(starts) == len(texts) else [0] * len(texts),
+                    }
+
+                if value is None:
+                    return {"text": [], "answer_start": []}
+
+                if isinstance(value, list):
+                    texts = [str(x).strip() for x in value if str(x).strip()]
+                    return {"text": texts, "answer_start": [0] * len(texts)}
+
+                text = str(value).strip()
+                if not text:
+                    return {"text": [], "answer_start": []}
+                return {"text": [text], "answer_start": [0]}
+
             predictions = {}
             for example_index, example in enumerate(examples):
                 feature_index = feature_per_example[example_index]
                 predictions[example_ids[example_index]] = decoded_preds[feature_index]
 
             formatted_predictions = [
-                {"id": k, "prediction_text": v}
+                {"id": k, "prediction_text": v, "no_answer_probability": 0.0}
                 for k, v in predictions.items()
             ]
 
             references = [
-                {"id": example_ids[i], "answers": ex[answer_column_local]}
+                {"id": example_ids[i], "answers": to_squad_answers(ex[answer_column_local])}
                 for i, ex in enumerate(examples)
             ]
             return EvalPrediction(predictions=formatted_predictions, label_ids=references)
@@ -719,23 +764,39 @@ def main():
     logger.info("Delegating to maybe_run_stitching(...)")
 
     if stitch_args.do_stitching:
-        results = maybe_run_stitching(
+        bootstrap_tokenizer_name = (
+            stitch_args.target_tokenizer_name_or_path
+            or stitch_args.target_base_model_name_or_path
+            or stitch_args.source_tokenizer_name_or_path
+            or stitch_args.source_base_model_name_or_path
+        )
+
+        stitch_tokenizer = AutoTokenizer.from_pretrained(
+            bootstrap_tokenizer_name,
+            cache_dir=model_args.cache_dir,
+            use_fast=model_args.use_fast_tokenizer,
+            revision=model_args.model_revision,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+
+        results = maybe_run_identity_stitching(
             stitch_args=stitch_args,
             model_name_or_path=model_args.model_name_or_path,
             training_args=training_args,
             data_args=data_args,
-            tokenizer=tokenizer,
+            tokenizer=stitch_tokenizer,
             train_dataset=None,
             train_examples=None,
             build_train_dataset_from_examples=None,
             eval_dataset=None,
             eval_examples=None,
             compute_metrics=compute_metrics,
-            post_process_function=make_post_processing_function(tokenizer),
+            post_process_function=make_post_processing_function(stitch_tokenizer, "answers"),
             trainer_builder=build_qa_trainer,
-            data_collator=data_collator,
+            data_collator=None,
         )
-        logger.info("Stitching results: %s", results)
+        logger.info("Identity stitching results: %s", results)
         return
         
     logger.info("=== STITCHING PIPELINE COMPLETE ===")
@@ -1023,7 +1084,7 @@ def main():
         processing_class=tokenizer,
         data_collator=data_collator,
         compute_metrics=compute_metrics if training_args.predict_with_generate else None,
-        post_process_function=make_post_processing_function(tokenizer),
+        post_process_function=make_post_processing_function(tokenizer, "answers"),
     )
     logger.info("=== TRAINER INITIALIZATION COMPLETE ===")
 
